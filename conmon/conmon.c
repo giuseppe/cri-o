@@ -25,6 +25,8 @@
 #include <glib.h>
 #include <glib-unix.h>
 
+#include <libcrun/container.h>
+
 #include "cmsg.h"
 
 #define pexit(fmt, ...)                                                          \
@@ -1247,103 +1249,8 @@ int main(int argc, char *argv[])
 	masterfd_stderr = fds[0];
 	slavefd_stderr = fds[1];
 
-	runtime_argv = g_ptr_array_new();
-	add_argv(runtime_argv,
-		 opt_runtime_path,
-		 NULL);
-
-	/* Generate the cmdline. */
-	if (!opt_exec && opt_systemd_cgroup)
-		add_argv(runtime_argv,
-			 "--systemd-cgroup",
-			 NULL);
-
-	if (opt_exec) {
-		add_argv(runtime_argv,
-			 "exec", "-d",
-			 "--pid-file", opt_pid_file,
-			 NULL);
-        } else {
-		add_argv(runtime_argv,
-			 "create",
-			 "--bundle", opt_bundle_path,
-			 "--pid-file", opt_pid_file,
-			 NULL);
-	}
-
-	if (!opt_exec && opt_no_pivot) {
-		add_argv(runtime_argv,
-			"--no-pivot",
-			NULL);
-	}
-
-	if (!opt_exec && opt_no_new_keyring) {
-		add_argv(runtime_argv,
-			"--no-new-keyring",
-			NULL);
-	}
-
-	if (csname != NULL) {
-		add_argv(runtime_argv,
-			 "--console-socket", csname,
-			 NULL);
-	}
-
-	/* Set the exec arguments. */
-	if (opt_exec) {
-		add_argv(runtime_argv,
-			 "--process", opt_exec_process_spec,
-			 NULL);
-	}
-
-	/* Container name comes last. */
-	add_argv(runtime_argv, opt_cid, NULL);
-	end_argv(runtime_argv);
-
-	/*
-	 * We have to fork here because the current runC API dups the stdio of the
-	 * calling process over the container's fds. This is actually *very bad*
-	 * but is currently being discussed for change in
-	 * https://github.com/opencontainers/runtime-spec/pull/513. Hopefully this
-	 * won't be the case for very long.
-	 */
-
-	/* Create our container. */
-	create_pid = fork();
-	if (create_pid < 0) {
-		pexit("Failed to fork the create command");
-	} else if (!create_pid) {
-		/* FIXME: This results in us not outputting runc error messages to crio's log. */
-		if (slavefd_stdin < 0)
-			slavefd_stdin = dev_null_r;
-		if (dup2(slavefd_stdin, STDIN_FILENO) < 0)
-			pexit("Failed to dup over stdout");
-
-		if (slavefd_stdout < 0)
-			slavefd_stdout = dev_null_w;
-		if (dup2(slavefd_stdout, STDOUT_FILENO) < 0)
-			pexit("Failed to dup over stdout");
-
-		if (slavefd_stderr < 0)
-			slavefd_stderr = slavefd_stdout;
-		if (dup2(slavefd_stderr, STDERR_FILENO) < 0)
-			pexit("Failed to dup over stderr");
-
-		execv(g_ptr_array_index(runtime_argv,0), (char **)runtime_argv->pdata);
-		exit(127);
-	}
-
-	g_ptr_array_free (runtime_argv, TRUE);
-
-	/* The runtime has that fd now. We don't need to touch it anymore. */
-	close(slavefd_stdin);
-	close(slavefd_stdout);
-	close(slavefd_stderr);
-
 	/* Map pid to its handler.  */
 	GHashTable *pid_to_handler = g_hash_table_new (g_int_hash, g_int_equal);
-	g_hash_table_insert (pid_to_handler, &create_pid, runtime_exit_cb);
-
 	/*
 	 * Glib does not support SIGCHLD so use SIGUSR1 with the same semantic.  We will
          * catch SIGCHLD and raise(SIGUSR1) in the signal handler.
@@ -1353,29 +1260,148 @@ int main(int argc, char *argv[])
 	if (signal(SIGCHLD, on_sigchld) == SIG_ERR)
 		pexit("Failed to set handler for SIGCHLD");
 
-	ninfo("about to waitpid: %d", create_pid);
-	if (csname != NULL) {
-		guint terminal_watch = g_unix_fd_add (console_socket_fd, G_IO_IN, terminal_accept_cb, csname);
-		/* Process any SIGCHLD we may have missed before the signal handler was in place.  */
-		check_child_processes (pid_to_handler);
-		g_main_loop_run (main_loop);
-		g_source_remove (terminal_watch);
+	bool runtime_failed = false;
+	if (strcmp(opt_runtime_path, "builtin") == 0) {
+		struct libcrun_context_s context;
+                libcrun_error_t err;
+
+		memset(&context, 0, sizeof (context));
+		/*FIXME: support --no-new-keyring and --no-pivot once they are in crun.  */
+		context.systemd_cgroup = opt_systemd_cgroup;
+		context.console_socket = csname;
+		context.detach = true;
+		context.pid_file = opt_pid_file;
+		context.bundle = opt_bundle_path ? opt_bundle_path : ".";
+		if (opt_exec) {
+			ret = libcrun_container_exec_process_file (&context, opt_cid, opt_exec_process_spec, &err);
+		} else {
+			libcrun_container *container;
+
+			if (chdir(opt_bundle_path) < 0)
+				pexit("Failed to chdir");
+			container = libcrun_container_load ("config.json", &err);
+			if (container == NULL)
+				pexit("Failed load config.json");
+
+			ret = libcrun_container_create (&context, container, &err);
+		}
+		runtime_failed = ret != 0;
 	} else {
-		int ret;
-		/* Wait for our create child to exit with the return code. */
-		do
-			ret = waitpid(create_pid, &runtime_status, 0);
-		while (ret < 0 && errno == EINTR);
-		if (ret < 0) {
-			int old_errno = errno;
-			kill(create_pid, SIGKILL);
-			errno = old_errno;
-			pexit("Failed to wait for `runtime %s`", opt_exec ? "exec" : "create");
+		runtime_argv = g_ptr_array_new();
+		add_argv(runtime_argv,
+			 opt_runtime_path,
+			 NULL);
+
+		/* Generate the cmdline. */
+		if (!opt_exec && opt_systemd_cgroup)
+			add_argv(runtime_argv,
+				 "--systemd-cgroup",
+				 NULL);
+
+		if (opt_exec) {
+			add_argv(runtime_argv,
+				 "exec", "-d",
+				 "--pid-file", opt_pid_file,
+				 NULL);
+	        } else {
+			add_argv(runtime_argv,
+				 "create",
+				 "--bundle", opt_bundle_path,
+				 "--pid-file", opt_pid_file,
+				 NULL);
 		}
 
+		if (!opt_exec && opt_no_pivot) {
+			add_argv(runtime_argv,
+				"--no-pivot",
+				NULL);
+		}
+
+		if (!opt_exec && opt_no_new_keyring) {
+			add_argv(runtime_argv,
+				"--no-new-keyring",
+				NULL);
+		}
+
+		if (csname != NULL) {
+			add_argv(runtime_argv,
+				 "--console-socket", csname,
+				 NULL);
+		}
+
+		/* Set the exec arguments. */
+		if (opt_exec) {
+			add_argv(runtime_argv,
+				 "--process", opt_exec_process_spec,
+				 NULL);
+		}
+
+		/* Container name comes last. */
+		add_argv(runtime_argv, opt_cid, NULL);
+		end_argv(runtime_argv);
+
+		/*
+		 * We have to fork here because the current runC API dups the stdio of the
+		 * calling process over the container's fds. This is actually *very bad*
+		 * but is currently being discussed for change in
+		 * https://github.com/opencontainers/runtime-spec/pull/513. Hopefully this
+		 * won't be the case for very long.
+		 */
+
+		/* Create our container. */
+		create_pid = fork();
+		if (create_pid < 0) {
+			pexit("Failed to fork the create command");
+		} else if (!create_pid) {
+			/* FIXME: This results in us not outputting runc error messages to crio's log. */
+			if (slavefd_stdin < 0)
+				slavefd_stdin = dev_null_r;
+			if (dup2(slavefd_stdin, STDIN_FILENO) < 0)
+				pexit("Failed to dup over stdout");
+
+			if (slavefd_stdout < 0)
+				slavefd_stdout = dev_null_w;
+			if (dup2(slavefd_stdout, STDOUT_FILENO) < 0)
+				pexit("Failed to dup over stdout");
+
+			if (slavefd_stderr < 0)
+				slavefd_stderr = slavefd_stdout;
+			if (dup2(slavefd_stderr, STDERR_FILENO) < 0)
+				pexit("Failed to dup over stderr");
+
+			execv(g_ptr_array_index(runtime_argv,0), (char **)runtime_argv->pdata);
+			exit(127);
+		}
+		g_ptr_array_free (runtime_argv, TRUE);
+		/* The runtime has that fd now. We don't need to touch it anymore. */
+		close(slavefd_stdin);
+		close(slavefd_stdout);
+		close(slavefd_stderr);
+		g_hash_table_insert (pid_to_handler, &create_pid, runtime_exit_cb);
+		ninfo("about to waitpid: %d", create_pid);
+		if (csname != NULL) {
+			guint terminal_watch = g_unix_fd_add (console_socket_fd, G_IO_IN, terminal_accept_cb, csname);
+			/* Process any SIGCHLD we may have missed before the signal handler was in place.  */
+			check_child_processes (pid_to_handler);
+			g_main_loop_run (main_loop);
+			g_source_remove (terminal_watch);
+		} else {
+			int ret;
+			/* Wait for our create child to exit with the return code. */
+			do
+				ret = waitpid(create_pid, &runtime_status, 0);
+			while (ret < 0 && errno == EINTR);
+			if (ret < 0) {
+				int old_errno = errno;
+				kill(create_pid, SIGKILL);
+				errno = old_errno;
+				pexit("Failed to wait for `runtime %s`", opt_exec ? "exec" : "create");
+			}
+		}
+		runtime_failed = !WIFEXITED(runtime_status) || WEXITSTATUS(runtime_status) != 0;
 	}
 
-	if (!WIFEXITED(runtime_status) || WEXITSTATUS(runtime_status) != 0) {
+	if (runtime_failed) {
 		if (sync_pipe_fd > 0) {
 			/*
 			 * Read from container stderr for any error and send it to parent
