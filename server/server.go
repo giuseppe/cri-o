@@ -522,3 +522,38 @@ func (s *Server) StartExitMonitor() {
 	}
 	<-done
 }
+
+// GetRuntimeConfigInfo returns configuration details from the runtime.
+func (s *Server) GetRuntimeConfigInfo(ctx context.Context, req *pb.GetRuntimeConfigInfoRequest) (*pb.GetRuntimeConfigInfoResponse, error) {
+	var uidMappings []*pb.LinuxIDMapping
+	var gidMappings []*pb.LinuxIDMapping
+
+	if s.defaultIDMappings == nil {
+		uidMappings = append(uidMappings, &pb.LinuxIDMapping{ContainerId: uint32(0)})
+		gidMappings = append(gidMappings, &pb.LinuxIDMapping{ContainerId: uint32(0)})
+	} else {
+		for _, u := range s.defaultIDMappings.UIDs() {
+			uidMappings = append(uidMappings, &pb.LinuxIDMapping{
+				ContainerId: uint32(u.ContainerID),
+				HostId:      uint32(u.HostID),
+				Size_:       uint32(u.Size),
+			})
+		}
+		for _, u := range s.defaultIDMappings.GIDs() {
+			gidMappings = append(gidMappings, &pb.LinuxIDMapping{
+				ContainerId: uint32(u.ContainerID),
+				HostId:      uint32(u.HostID),
+				Size_:       uint32(u.Size),
+			})
+		}
+	}
+	response := &pb.GetRuntimeConfigInfoResponse{
+		RuntimeConfig: &pb.ActiveRuntimeConfig{
+			UserNamespaceConfig: &pb.LinuxUserNamespaceConfig{
+				UidMappings: uidMappings,
+				GidMappings: gidMappings,
+			},
+		},
+	}
+	return response, nil
+}
